@@ -74,16 +74,18 @@ class SonarQubeAgent:
     async def process_query(self, user_query: str) -> str:
         print(f"💬 Usuario: {user_query}\n")
 
+        is_valid_intent, intent_error = self.guardrails.validate_intent(user_query)
+        if not is_valid_intent:
+            print("Query fuera de scope técnico", "WARNING")
+            return intent_error
+
         # ✅ GUARDRAIL: Validar input del usuario
         is_valid, error_msg = self.guardrails.validate_user_input(user_query)
         if not is_valid:
             print(f"Input bloqueado: {error_msg}", "WARNING")
             return f"🚫 {error_msg}"
 
-        # Iniciar timer y reset tokens
-        import time
-        self.start_time = time.time()
-        self.tokens_used = 0
+
 
         self.conversation_history.append({
             "role": "user",
@@ -99,44 +101,28 @@ class SonarQubeAgent:
             response = self.anthropic.messages.create(
                 model="claude-haiku-4-5",
                 max_tokens=4096,
-                system="""Eres un asistente experto en análisis y migración de código Java.
+                system="""Asistente experto en análisis y migración de código Java.
 
-Tienes acceso a herramientas de:
-- **SonarQube**: Análisis de calidad, issues, vulnerabilidades, métricas
-- **OpenRewrite**: Migración automática de código, refactoring
-- **GitHub**: Gestión de repositorios, lectura de código fuente, búsqueda, clonación
-- **PlantUML**: Generación de diagramas UML (clases, secuencia, estados, componentes)
+SCOPE PERMITIDO:
+- Análisis de código (SonarQube): métricas, issues, vulnerabilidades
+- Migración/refactoring (OpenRewrite): actualización de versiones
+- Repositorios (GitHub): lectura, clonación, búsqueda de código
+- Diagramas (PlantUML): clases, secuencia, estados, componentes
 
-**IMPORTANTE - Cuándo usar cada herramienta:**
+Si la consulta NO es técnica relacionada con lo anterior, responde:
+"Esta consulta está fuera de mi área. Solo ayudo con análisis de código, migraciones y diagramas técnicos."
 
-Para visualizar arquitectura o código:
-1. Si el usuario pide "diagrama", "UML", "visualizar", "graficar" → USA PlantUML
-2. Si necesitas analizar código primero → GitHub para leer, luego PlantUML para graficar
-3. PlantUML puede crear: diagramas de clases, secuencia, estados, componentes
+CUÁNDO USAR CADA HERRAMIENTA:
+- "diagrama/UML/visualizar" → PlantUML
+- "métricas/calidad/issues" → SonarQube
+- "leer código/repositorio" → GitHub
+- "migrar/actualizar/refactor" → OpenRewrite
 
-Para análisis de calidad:
-- SonarQube para métricas, issues, quality gates.
+WORKFLOWS:
+Diagramas: GitHub (leer código) → PlantUML (crear diagrama)
+Reportes: GitHub → SonarQube → PlantUML → OpenRewrite → generar reporte
 
-Para código fuente:
-- GitHub para clonar, leer archivos, buscar código.
-
-Para migración:
-- OpenRewrite para planes de migración y refactoring.
-
-**Workflow típico para diagramas:**
-1. Si hay código → GitHub clone/read
-2. Analizar estructura del código
-3. Usar herramienta PlantUML correspondiente (plantuml_create_class_diagram, plantuml_create_sequence_diagram, etc)
-4. PlantUML genera el diagrama automáticamente
-
-**Workflow típico para reportes:**
-1. Buscar el proyecto en github (read/clone).
-2. Buscar proyecto en sonarqube (leer analisis y metricas).
-3. Usar herramienta PlantUML para diagramar.
-4. Simular plan de migracion/actualizacion del proyecto con openrewrite.
-5. Generar contenido con toda la informacion recopilada de los pasos anteriores.
-
-Explica qué herramienta usas y el por qué.""",
+Explica brevemente qué herramienta usas.""",
                 messages=self.conversation_history,
                 tools=self.tools_schema
             )
@@ -166,6 +152,12 @@ Explica qué herramienta usas y el por qué.""",
                     (block.text for block in response.content if block.type == "text"),
                     "No hay respuesta"
                 )
+                # ✅ GUARDRAIL: Validar output del LLM
+                is_valid, error_msg = self.guardrails.validate_llm_output(final_text)
+                if not is_valid:
+                    print(f"Output bloqueado: {error_msg}", "WARNING")
+                    return "🚫 Respuesta bloqueada por contener información sensible"
+
                 return final_text
 
             print(f"🔧 Ejecutando {len(tool_calls)} herramienta(s)...")
