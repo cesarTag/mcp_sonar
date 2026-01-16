@@ -1,117 +1,282 @@
 import asyncio
-import httpx
 import json
-import re
+import os
+from anthropic import Anthropic
 
-SONARQUBE_TOKEN = "dad1da5727a0c251ee00b49649fd07a8fd9fbae1"
-SERVER_URL = "http://localhost:8080"
+from guardrails_config import AgentGuardrails
+from openrewrite_tool import openrewrite_tool
+from plantuml_tool import plantuml_tool
+from sonar_client import SonarQubeMCPClient
+from github_tool import github_tool
 
 
-class SonarQubeMCPClient:
-    def __init__(self, url: str, token: str):
-        self.base_url = url
-        self.token = token
-        self.client = None
-        self.session_id = None
-        self.request_id = 0
+SERVER_URL = os.getenv("SERVER_URL")
+SONARQUBE_TOKEN = os.getenv("SONARQUBE_TOKEN")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
-    async def __aenter__(self):
-        self.client = httpx.AsyncClient(timeout=30.0)
 
-        # Inicializar
-        response = await self.client.post(
-            f"{self.base_url}/mcp",
-            headers={
-                "SONARQUBE_TOKEN": self.token,
-                "Content-Type": "application/json",
-                "Accept": "text/event-stream, application/json"
-            },
-            json={
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {"name": "python-client", "version": "1.0"}
-                }
+class SonarQubeAgent:
+    def __init__(self, mcp_client: SonarQubeMCPClient):
+        self.mcp_client = mcp_client
+        self.openrewrite = openrewrite_tool
+        self.github = github_tool
+        self.plantuml = plantuml_tool
+        self.anthropic = Anthropic(api_key=ANTHROPIC_API_KEY)
+        self.guardrails = AgentGuardrails()
+        self.tools_schema = []
+        self.conversation_history = []
+
+    async def initialize(self):
+        print("🔧 Cargando herramientas...")
+
+        # 1. Cargar herramientas del servidor MCP SonarQube
+        sonar_tools = await self.mcp_client.list_tools()
+        sonar_schema = [
+            {
+                "name": tool["name"],
+                "description": tool.get("description", ""),
+                "input_schema": tool.get("inputSchema", {"type": "object", "properties": {}})
             }
-        )
-        response.raise_for_status()
+            for tool in sonar_tools
+        ]
 
-        self.session_id = response.headers.get("mcp-session-id")
-        if not self.session_id:
-            raise Exception("No session ID recibido")
+        # 2. Cargar herramientas locales de OpenRewrite
+        openrewrite_schema = self.openrewrite.get_tools_schema()
+        plantuml_schema = self.plantuml.get_tools_schema()
+        github_schema = self.github.get_tools_schema()
 
-        result = response.json()
-        server_info = result.get("result", {}).get("serverInfo", {})
-        print(f"✅ Conectado: {server_info.get('name')} v{server_info.get('version')}\n")
+        # 3. Combinar todas las herramientas
+        self.tools_schema = sonar_schema + openrewrite_schema +github_schema+plantuml_schema
 
-        self.request_id = 1
-        return self
+        print(f"✅ SonarQube: {len(sonar_schema)} herramientas")
+        print(f"✅ OpenRewrite: {len(openrewrite_schema)} herramientas")
+        print(f"✅ GitHub: {len(github_schema)} herramientas")
+        print(f"✅ PlantUML: {len(plantuml_schema)} herramientas")
+        print(f"📦 Total: {len(self.tools_schema)} herramientas disponibles\n")
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.client.aclose()
+    async def _execute_tool(self, tool_name: str, arguments: dict):
+        """Ejecutar herramienta (local o remota)"""
 
-    def _parse_sse_response(self, text: str) -> dict:
-        """Parsear respuesta SSE y extraer JSON"""
-        match = re.search(r'data:\s*(\{.*\})', text)
-        if match:
-            return json.loads(match.group(1))
-        raise ValueError("No se encontró JSON válido en respuesta SSE")
+        if tool_name.startswith("plantuml_"):
+            return await self.plantuml.execute_tool(tool_name, arguments)
 
-    async def call_method(self, method: str, params: dict = None):
-        """Llamar méthod MCP"""
-        self.request_id += 1
+        if tool_name.startswith("github_"):
+            return await self.github.execute_tool(tool_name, arguments)
 
-        response = await self.client.post(
-            f"{self.base_url}/mcp",
-            headers={
-                "SONARQUBE_TOKEN": self.token,
-                "mcp-session-id": self.session_id,
-                "Content-Type": "application/json",
-                "Accept": "text/event-stream, application/json"
-            },
-            json={
-                "jsonrpc": "2.0",
-                "id": self.request_id,
-                "method": method,
-                "params": params or {}
-            }
-        )
-        response.raise_for_status()
+        # Herramientas de OpenRewrite (locales)
+        if tool_name.startswith("openrewrite_"):
+            return await self.openrewrite.execute_tool(tool_name, arguments)
 
-        return self._parse_sse_response(response.text)
+        # Herramientas de SonarQube (remotas)
+        else:
+            return await self.mcp_client.call_tool(tool_name, arguments)
 
-    async def list_tools(self):
-        """Listar herramientas"""
-        result = await self.call_method("tools/list")
-        return result.get("result", {}).get("tools", [])
+    async def process_query(self, user_query: str) -> str:
+        print(f"💬 Usuario: {user_query}\n")
 
-    async def call_tool(self, tool_name: str, arguments: dict):
-        """Ejecutar herramienta"""
-        result = await self.call_method("tools/call", {
-            "name": tool_name,
-            "arguments": arguments
+        # ✅ GUARDRAIL: Validar input del usuario
+        is_valid, error_msg = self.guardrails.validate_user_input(user_query)
+        if not is_valid:
+            print(f"Input bloqueado: {error_msg}", "WARNING")
+            return f"🚫 {error_msg}"
+
+        # Iniciar timer y reset tokens
+        import time
+        self.start_time = time.time()
+        self.tokens_used = 0
+
+        self.conversation_history.append({
+            "role": "user",
+            "content": user_query
         })
-        return result.get("result")
+
+        max_iterations = 50  # Aumentado para permitir más herramientas
+        iteration = 0
+
+        while iteration < max_iterations:
+            iteration += 1
+
+            response = self.anthropic.messages.create(
+                model="claude-haiku-4-5",
+                max_tokens=4096,
+                system="""Eres un asistente experto en análisis y migración de código Java.
+
+Tienes acceso a herramientas de:
+- **SonarQube**: Análisis de calidad, issues, vulnerabilidades, métricas
+- **OpenRewrite**: Migración automática de código, refactoring
+- **GitHub**: Gestión de repositorios, lectura de código fuente, búsqueda, clonación
+- **PlantUML**: Generación de diagramas UML (clases, secuencia, estados, componentes)
+
+**IMPORTANTE - Cuándo usar cada herramienta:**
+
+Para visualizar arquitectura o código:
+1. Si el usuario pide "diagrama", "UML", "visualizar", "graficar" → USA PlantUML
+2. Si necesitas analizar código primero → GitHub para leer, luego PlantUML para graficar
+3. PlantUML puede crear: diagramas de clases, secuencia, estados, componentes
+
+Para análisis de calidad:
+- SonarQube para métricas, issues, quality gates.
+
+Para código fuente:
+- GitHub para clonar, leer archivos, buscar código.
+
+Para migración:
+- OpenRewrite para planes de migración y refactoring.
+
+**Workflow típico para diagramas:**
+1. Si hay código → GitHub clone/read
+2. Analizar estructura del código
+3. Usar herramienta PlantUML correspondiente (plantuml_create_class_diagram, plantuml_create_sequence_diagram, etc)
+4. PlantUML genera el diagrama automáticamente
+
+**Workflow típico para reportes:**
+1. Buscar el proyecto en github (read/clone).
+2. Buscar proyecto en sonarqube (leer analisis y metricas).
+3. Usar herramienta PlantUML para diagramar.
+4. Simular plan de migracion/actualizacion del proyecto con openrewrite.
+5. Generar contenido con toda la informacion recopilada de los pasos anteriores.
+
+Explica qué herramienta usas y el por qué.""",
+                messages=self.conversation_history,
+                tools=self.tools_schema
+            )
+
+            assistant_content = []
+            tool_calls = []
+
+            for block in response.content:
+                if block.type == "text":
+                    assistant_content.append({"type": "text", "text": block.text})
+                elif block.type == "tool_use":
+                    tool_calls.append(block)
+                    assistant_content.append({
+                        "type": "tool_use",
+                        "id": block.id,
+                        "name": block.name,
+                        "input": block.input
+                    })
+
+            self.conversation_history.append({
+                "role": "assistant",
+                "content": assistant_content
+            })
+
+            if not tool_calls:
+                final_text = next(
+                    (block.text for block in response.content if block.type == "text"),
+                    "No hay respuesta"
+                )
+                return final_text
+
+            print(f"🔧 Ejecutando {len(tool_calls)} herramienta(s)...")
+            tool_results = []
+
+            for tool_call in tool_calls:
+                # Determinar fuente de la herramienta - CORREGIDO
+                tool_name = tool_call.name
+                if tool_name.startswith("github_"):
+                    tool_source = "GitHub"
+                elif tool_name.startswith("openrewrite_"):
+                    tool_source = "OpenRewrite"
+                elif tool_name.startswith("plantuml_"):
+                    tool_source = "PlantUML"
+                else:
+                    tool_source = "SonarQube"
+
+                print(f"  → [{tool_source}] {tool_name}")
+
+                if not self.guardrails.validate_tool_arguments(tool_name, tool_call.input):
+                    print(f"Argumentos bloqueados para {tool_name}", "WARNING")
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_call.id,
+                        "content": "Operación bloqueada por guardrails de seguridad",
+                        "is_error": True
+                    })
+                    continue
+
+                try:
+                    result = await self._execute_tool(
+                        tool_name,
+                        tool_call.input
+                    )
+
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_call.id,
+                        "content": json.dumps(result, ensure_ascii=False, indent=2)
+                    })
+                except Exception as e:
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_call.id,
+                        "content": f"Error: {str(e)}",
+                        "is_error": True
+                    })
+
+            self.conversation_history.append({
+                "role": "user",
+                "content": tool_results
+            })
+
+            print()
+
+        return "⚠️ Límite de iteraciones alcanzado"
 
 
-async def main():
-    async with SonarQubeMCPClient(SERVER_URL, SONARQUBE_TOKEN) as client:
-        # Listar herramientas
-        print("📋 Herramientas disponibles:")
-        tools = await client.list_tools()
-        for i, tool in enumerate(tools, 1):
-            print(f"{i:2}. {tool.get('name')}")
-        print(f"\nTotal: {len(tools)}\n")
+async def demo_mode():
+    """Modo demo con ejemplos"""
+    async with SonarQubeMCPClient(SERVER_URL, SONARQUBE_TOKEN) as mcp_client:
+        agent = SonarQubeAgent(mcp_client)
+        await agent.initialize()
 
-        # Listar proyectos
+        queries = [
+            "¿Qué proyectos tengo en SonarQube?",
+            "Dame un plan de actualización de código deprecado de Java 8 a Java 21 para el proyecto /path/to/my/project",
+            "¿Qué recetas de migración están disponibles para Spring Boot?"
+        ]
+
+        for query in queries:
+            print("=" * 60)
+            response = await agent.process_query(query)
+            print(f"🤖 Asistente:\n{response}\n")
+
+            agent.conversation_history = []  # Limpiar entre consultas
+
+
+async def interactive_mode():
+    """Modo interactivo"""
+    async with SonarQubeMCPClient(SERVER_URL, SONARQUBE_TOKEN) as mcp_client:
+        agent = SonarQubeAgent(mcp_client)
+        await agent.initialize()
+
         print("=" * 60)
-        print("🔍 Proyectos:\n")
-        projects = await client.call_tool("list_sonar_projects", {})
-        print(json.dumps(projects, indent=2))
+        print("🤖 Agente SonarQube + OpenRewrite + GitHub listo")
+        print("   Pregunta sobre calidad de código o migraciones")
+        print("   Escribe 'salir' para terminar")
+        print("=" * 60 + "\n")
+
+        while True:
+            try:
+                query = input("💬 Tú: ").strip()
+
+                if query.lower() in ['salir', 'exit', 'quit']:
+                    print("\n👋 ¡Hasta luego!")
+                    break
+
+                if not query:
+                    continue
+
+                print()
+                response = await agent.process_query(query)
+                print(f"🤖 Asistente:\n{response}\n")
+
+            except KeyboardInterrupt:
+                print("\n\n👋 ¡Hasta luego!")
+                break
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Elige el modo:
+    # asyncio.run(demo_mode())
+    asyncio.run(interactive_mode())

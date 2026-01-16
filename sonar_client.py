@@ -1,7 +1,9 @@
 import httpx
 import json
 import re
+from dotenv import load_dotenv
 
+load_dotenv()
 
 class SonarQubeMCPTransport:
     """Transporte HTTP personalizado para SonarQube MCP"""
